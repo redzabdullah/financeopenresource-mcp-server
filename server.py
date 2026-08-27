@@ -1,9 +1,15 @@
 """A small MCP server that exposes public Yahoo Finance market data."""
 
 import os
+import json
+import re
 from datetime import date, datetime, timezone
 from math import isnan
 from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlencode
+from urllib.request import Request, urlopen
+from xml.etree import ElementTree
 
 import yfinance as yf
 from yfinance.const import SECTOR_INDUSTY_MAPPING_LC
@@ -52,6 +58,69 @@ def _ticker_validation_error(stock: yf.Ticker, symbol: str) -> dict | None:
     except Exception as exc:
         return {"error": f"Could not validate ticker '{symbol}': {exc}"}
     return None
+
+
+OPENALEX_MAILTO = "redzuana@smu.edu.sg"
+RESEARCH_HTTP_TIMEOUT = 15
+
+
+class _ResearchAPIError(Exception):
+    """Represent an expected failure from an external research API."""
+
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
+
+
+def _research_http_get(url: str, params: dict | None = None) -> bytes:
+    """Fetch an external research API response with a bounded timeout."""
+    if params:
+        separator = "&" if "?" in url else "?"
+        url = f"{url}{separator}{urlencode(params)}"
+    request = Request(url, headers={"User-Agent": "finance-research-mcp/1.0"})
+    try:
+        with urlopen(request, timeout=RESEARCH_HTTP_TIMEOUT) as response:
+            return response.read()
+    except HTTPError as exc:
+        raise _ResearchAPIError(f"HTTP {exc.code}", status=exc.code) from exc
+    except (URLError, TimeoutError, OSError) as exc:
+        raise _ResearchAPIError(str(exc)) from exc
+
+
+def _research_http_get_json(url: str, params: dict | None = None) -> dict:
+    """Fetch and decode a JSON response from a research API."""
+    try:
+        return json.loads(_research_http_get(url, params).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise _ResearchAPIError("the service returned invalid JSON") from exc
+
+
+def _openalex_abstract(inverted_index: Any) -> str | None:
+    """Reconstruct OpenAlex's inverted-index abstract representation."""
+    if not isinstance(inverted_index, dict) or not inverted_index:
+        return None
+    positioned_words = []
+    for word, positions in inverted_index.items():
+        if isinstance(positions, list):
+            positioned_words.extend((position, word) for position in positions)
+    return " ".join(word for _, word in sorted(positioned_words)) or None
+
+
+def _snippet(text: str | None, length: int = 500) -> str | None:
+    """Return a compact single-line text preview."""
+    if not text:
+        return None
+    compact = " ".join(text.split())
+    return compact if len(compact) <= length else f"{compact[: length - 1].rstrip()}…"
+
+
+def _openalex_authors(work: dict) -> list[str]:
+    """Extract display names from an OpenAlex work."""
+    return [
+        author.get("author", {}).get("display_name")
+        for author in work.get("authorships", [])
+        if author.get("author", {}).get("display_name")
+    ]
 
 
 # All tools on this server are read-only data lookups. Use this annotations
@@ -618,6 +687,284 @@ def get_sustainability(ticker: str = "") -> dict:
         return {
             "error": f"Could not fetch sustainability data for ticker '{symbol}': {exc}"
         }
+
+
+@mcp.tool(
+    title="Search Finance Research",
+    annotations=ToolAnnotations(
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
+    ),
+)
+def search_finance_research(
+    query: str = "", year_from: int = None, limit: int = 10
+) -> dict:
+    """Search OpenAlex for business, economics, finance, and accounting works.
+
+    Results are limited to at most 50 works, so additional matches may be
+    truncated. Replace ``OPENALEX_MAILTO`` with a deployment contact email.
+    """
+    normalized_query = _normalize_text(query)
+    if not normalized_query:
+        return {"error": "Please provide a research search query."}
+    if year_from is not None and (
+        isinstance(year_from, bool)
+        or not isinstance(year_from, int)
+        or year_from < 1000
+        or year_from > datetime.now().year
+    ):
+        return {
+            "error": (
+                f"Invalid year_from '{year_from}'. Provide a year from 1000 through "
+                f"{datetime.now().year}."
+            )
+        }
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 50:
+        return {"error": "Invalid limit. Provide an integer from 1 through 50."}
+
+    filters = ["topics.field.id:14|20"]
+    if year_from is not None:
+        filters.append(f"from_publication_date:{year_from}-01-01")
+    try:
+        payload = _research_http_get_json(
+            "https://api.openalex.org/works",
+            {
+                "search": normalized_query,
+                "filter": ",".join(filters),
+                "per-page": limit,
+                "mailto": OPENALEX_MAILTO,
+            },
+        )
+        works = payload.get("results") or []
+        if not works:
+            return {"error": f"No finance research found for query '{normalized_query}'."}
+
+        results = []
+        for work in works[:limit]:
+            location = work.get("primary_location") or {}
+            source = location.get("source") or {}
+            oa_location = work.get("best_oa_location") or {}
+            abstract = _openalex_abstract(work.get("abstract_inverted_index"))
+            results.append(
+                {
+                    "title": work.get("title") or work.get("display_name"),
+                    "authors": _openalex_authors(work),
+                    "year": work.get("publication_year"),
+                    "journal": source.get("display_name"),
+                    "doi": work.get("doi"),
+                    "open_access_pdf_url": oa_location.get("pdf_url")
+                    or location.get("pdf_url"),
+                    "abstract_snippet": _snippet(abstract),
+                    "cited_by_count": work.get("cited_by_count", 0),
+                }
+            )
+        return {"query": normalized_query, "results": results}
+    except Exception as exc:
+        return {"error": f"Could not search OpenAlex: {exc}"}
+
+
+@mcp.tool(
+    title="Get Research Paper",
+    annotations=ToolAnnotations(
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
+    ),
+)
+def get_research_paper(doi_or_openalex_id: str = "") -> dict:
+    """Return full OpenAlex details for one DOI or OpenAlex work ID."""
+    identifier = _normalize_text(doi_or_openalex_id)
+    if not identifier:
+        return {"error": "Please provide a DOI or OpenAlex work ID."}
+
+    if identifier.lower().startswith("doi:"):
+        identifier = identifier[4:].strip()
+    if identifier.lower().startswith("https://doi.org/"):
+        identifier = f"https://doi.org/{identifier.split('/', 3)[-1]}"
+    elif re.fullmatch(r"10\.\d{4,9}/\S+", identifier, flags=re.IGNORECASE):
+        identifier = f"https://doi.org/{identifier}"
+    elif identifier.lower().startswith("https://openalex.org/"):
+        identifier = identifier.rstrip("/").rsplit("/", 1)[-1]
+    elif not re.fullmatch(r"W\d+", identifier, flags=re.IGNORECASE):
+        return {
+            "error": (
+                f"Invalid paper identifier '{doi_or_openalex_id}'. Provide a DOI or "
+                "an OpenAlex work ID such as W2741809807."
+            )
+        }
+
+    try:
+        work = _research_http_get_json(
+            f"https://api.openalex.org/works/{quote(identifier, safe=':/')}",
+            {"mailto": OPENALEX_MAILTO},
+        )
+        topics = []
+        for topic in work.get("topics") or []:
+            topics.append(
+                {
+                    "name": topic.get("display_name"),
+                    "score": topic.get("score"),
+                    "subfield": (topic.get("subfield") or {}).get("display_name"),
+                    "field": (topic.get("field") or {}).get("display_name"),
+                    "domain": (topic.get("domain") or {}).get("display_name"),
+                }
+            )
+        concepts = [
+            {"name": concept.get("display_name"), "score": concept.get("score")}
+            for concept in (work.get("concepts") or [])
+        ]
+        location = work.get("primary_location") or {}
+        source = location.get("source") or {}
+        return {
+            "openalex_id": work.get("id"),
+            "doi": work.get("doi"),
+            "title": work.get("title") or work.get("display_name"),
+            "authors": _openalex_authors(work),
+            "year": work.get("publication_year"),
+            "journal": source.get("display_name"),
+            "abstract": _openalex_abstract(work.get("abstract_inverted_index")),
+            "topics": topics,
+            "concepts": concepts,
+            "cited_by_count": work.get("cited_by_count", 0),
+            "referenced_works_count": len(work.get("referenced_works") or []),
+        }
+    except _ResearchAPIError as exc:
+        if exc.status == 404:
+            return {"error": f"No OpenAlex work found for '{doi_or_openalex_id}'."}
+        return {"error": f"Could not fetch the OpenAlex work: {exc}"}
+    except Exception as exc:
+        return {"error": f"Could not fetch the OpenAlex work: {exc}"}
+
+
+@mcp.tool(
+    title="Search Finance Preprints",
+    annotations=ToolAnnotations(
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
+    ),
+)
+def search_finance_preprints(query: str = "", limit: int = 10) -> dict:
+    """Search arXiv quantitative-finance and economics preprints.
+
+    Results are limited to at most 50 preprints, so additional matches may be
+    truncated.
+    """
+    normalized_query = _normalize_text(query)
+    if not normalized_query:
+        return {"error": "Please provide a preprint search query."}
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 50:
+        return {"error": "Invalid limit. Provide an integer from 1 through 50."}
+
+    try:
+        xml_payload = _research_http_get(
+            "https://export.arxiv.org/api/query",
+            {
+                "search_query": (
+                    f'(all:"{normalized_query}") AND (cat:q-fin.* OR cat:econ.*)'
+                ),
+                "start": 0,
+                "max_results": limit,
+                "sortBy": "relevance",
+                "sortOrder": "descending",
+            },
+        )
+        root = ElementTree.fromstring(xml_payload)
+        atom = {"atom": "http://www.w3.org/2005/Atom"}
+        entries = root.findall("atom:entry", atom)
+        if not entries:
+            return {"error": f"No finance preprints found for query '{normalized_query}'."}
+
+        results = []
+        for entry in entries[:limit]:
+            entry_id = entry.findtext("atom:id", default="", namespaces=atom)
+            pdf_link = None
+            for link in entry.findall("atom:link", atom):
+                if link.get("title") == "pdf" or link.get("type") == "application/pdf":
+                    pdf_link = link.get("href")
+                    break
+            results.append(
+                {
+                    "title": " ".join(
+                        entry.findtext("atom:title", default="", namespaces=atom).split()
+                    ),
+                    "authors": [
+                        author.findtext("atom:name", default="", namespaces=atom)
+                        for author in entry.findall("atom:author", atom)
+                    ],
+                    "submission_date": entry.findtext(
+                        "atom:published", default=None, namespaces=atom
+                    ),
+                    "arxiv_id": entry_id.rstrip("/").rsplit("/", 1)[-1],
+                    "abstract_snippet": _snippet(
+                        entry.findtext("atom:summary", default=None, namespaces=atom)
+                    ),
+                    "pdf_link": pdf_link,
+                    "review_status": "preprint - not peer reviewed",
+                }
+            )
+        return {"query": normalized_query, "results": results}
+    except ElementTree.ParseError:
+        return {"error": "Could not search arXiv: the service returned invalid XML."}
+    except Exception as exc:
+        return {"error": f"Could not search arXiv: {exc}"}
+
+
+@mcp.tool(
+    title="Check Journal Legitimacy",
+    annotations=ToolAnnotations(
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
+    ),
+)
+def check_journal_legitimacy(journal_name_or_issn: str = "") -> dict:
+    """Check whether a journal is listed in DOAJ's vetted directory."""
+    search_value = _normalize_text(journal_name_or_issn)
+    if not search_value:
+        return {"error": "Please provide a journal name or ISSN."}
+
+    compact_issn = search_value.replace("-", "")
+    is_issn = bool(re.fullmatch(r"\d{7}[\dXx]", compact_issn))
+    query_field = "index.issn.exact" if is_issn else "bibjson.title"
+    doaj_query = f'{query_field}:"{search_value.replace(chr(34), "")}"'
+    try:
+        payload = _research_http_get_json(
+            f"https://doaj.org/api/search/journals/{quote(doaj_query, safe='')}",
+            {"pageSize": 1},
+        )
+        results = payload.get("results") or []
+        if not results:
+            return {"query": search_value, "found": False}
+
+        journal = results[0].get("bibjson") or {}
+        issns = [
+            identifier.get("id")
+            for identifier in (journal.get("identifier") or [])
+            if identifier.get("type") in {"pissn", "eissn"} and identifier.get("id")
+        ]
+        for issn_field in ("pissn", "eissn"):
+            if journal.get(issn_field) and journal[issn_field] not in issns:
+                issns.append(journal[issn_field])
+        subjects = []
+        for subject in journal.get("subject") or []:
+            value = subject.get("term") or subject.get("code")
+            if value and value not in subjects:
+                subjects.append(value)
+        return {
+            "query": search_value,
+            "found": True,
+            "title": journal.get("title"),
+            "issn": issns,
+            "subject_areas": subjects,
+        }
+    except Exception as exc:
+        return {"error": f"Could not check the DOAJ directory: {exc}"}
 
 
 if __name__ == "__main__":
