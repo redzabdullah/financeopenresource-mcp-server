@@ -39,6 +39,21 @@ def _iso_datetime(value: Any) -> str | None:
     return str(value)
 
 
+def _normalize_text(value: Any) -> str:
+    """Normalize a string parameter without raising on malformed input."""
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _ticker_validation_error(stock: yf.Ticker, symbol: str) -> dict | None:
+    """Return a structured error when Yahoo has no market data for a symbol."""
+    try:
+        if stock.history(period="5d").empty:
+            return {"error": f"Invalid ticker '{symbol}': no market data was found."}
+    except Exception as exc:
+        return {"error": f"Could not validate ticker '{symbol}': {exc}"}
+    return None
+
+
 # All tools on this server are read-only data lookups. Use this annotations
 # pattern for every tool added here so clients classify them correctly.
 @mcp.tool(
@@ -50,9 +65,9 @@ def _iso_datetime(value: Any) -> str | None:
         open_world_hint=True,
     ),
 )
-def get_stock_quote(ticker: str) -> dict:
+def get_stock_quote(ticker: str = "") -> dict:
     """Return the latest public Yahoo Finance quote for a ticker symbol."""
-    symbol = ticker.strip().upper()
+    symbol = _normalize_text(ticker).upper()
     if not symbol:
         return {"error": "Please provide a ticker symbol."}
 
@@ -62,7 +77,7 @@ def get_stock_quote(ticker: str) -> dict:
 
         # Yahoo returns an empty history for unknown or delisted symbols.
         if history.empty:
-            return {"error": f"No market data found for ticker '{symbol}'."}
+            return {"error": f"Invalid ticker '{symbol}': no market data was found."}
 
         latest = history.iloc[-1]
         fast_info = stock.fast_info
@@ -106,7 +121,7 @@ def get_stock_quote(ticker: str) -> dict:
     ),
 )
 def get_historical_prices(
-    ticker: str, period: str = "1mo", interval: str = "1d"
+    ticker: str = "", period: str = "1mo", interval: str = "1d"
 ) -> dict:
     """Return historical OHLCV prices from Yahoo Finance.
 
@@ -128,9 +143,9 @@ def get_historical_prices(
     }
     valid_intervals = {"1d", "1wk", "1mo"}
 
-    symbol = ticker.strip().upper()
-    selected_period = period.strip().lower()
-    selected_interval = interval.strip().lower()
+    symbol = _normalize_text(ticker).upper()
+    selected_period = _normalize_text(period).lower()
+    selected_interval = _normalize_text(interval).lower()
 
     if not symbol:
         return {"error": "Please provide a ticker symbol."}
@@ -154,13 +169,7 @@ def get_historical_prices(
             period=selected_period, interval=selected_interval
         )
         if history.empty:
-            return {
-                "error": (
-                    f"No historical data found for ticker '{symbol}' with "
-                    f"period '{selected_period}' and interval "
-                    f"'{selected_interval}'."
-                )
-            }
+            return {"error": f"Invalid ticker '{symbol}': no market data was found."}
 
         prices = []
         for timestamp, row in history.tail(250).iterrows():
@@ -197,7 +206,7 @@ def get_historical_prices(
     ),
 )
 def get_financial_statements(
-    ticker: str, statement: str = "income", period: str = "annual"
+    ticker: str = "", statement: str = "income", period: str = "annual"
 ) -> dict:
     """Return financial statement periods and line items from Yahoo Finance.
 
@@ -215,9 +224,9 @@ def get_financial_statements(
     valid_statements = {"income", "balance", "cashflow"}
     valid_periods = {"annual", "quarterly"}
 
-    symbol = ticker.strip().upper()
-    selected_statement = statement.strip().lower()
-    selected_period = period.strip().lower()
+    symbol = _normalize_text(ticker).upper()
+    selected_statement = _normalize_text(statement).lower()
+    selected_period = _normalize_text(period).lower()
 
     if not symbol:
         return {"error": "Please provide a ticker symbol."}
@@ -238,6 +247,8 @@ def get_financial_statements(
 
     try:
         stock = yf.Ticker(symbol)
+        if ticker_error := _ticker_validation_error(stock, symbol):
+            return ticker_error
         attribute = statement_attributes[(selected_statement, selected_period)]
         statement_data = getattr(stock, attribute)
         data = []
@@ -271,15 +282,15 @@ def get_financial_statements(
         open_world_hint=True,
     ),
 )
-def get_corporate_actions(ticker: str, action_type: str = "all") -> dict:
+def get_corporate_actions(ticker: str = "", action_type: str = "all") -> dict:
     """Return dividends and stock splits from Yahoo Finance.
 
     Each requested action type is limited to its 100 most recent entries, so
     older corporate actions may be truncated.
     """
     valid_action_types = {"all", "dividends", "splits"}
-    symbol = ticker.strip().upper()
-    selected_action_type = action_type.strip().lower()
+    symbol = _normalize_text(ticker).upper()
+    selected_action_type = _normalize_text(action_type).lower()
 
     if not symbol:
         return {"error": "Please provide a ticker symbol."}
@@ -293,26 +304,35 @@ def get_corporate_actions(ticker: str, action_type: str = "all") -> dict:
 
     try:
         stock = yf.Ticker(symbol)
+        if ticker_error := _ticker_validation_error(stock, symbol):
+            return ticker_error
         dividends = None
         splits = None
 
         if selected_action_type in {"all", "dividends"}:
             dividend_series = stock.dividends
-            dividends = [
-                {"date": timestamp.date().isoformat(), "amount": _json_value(amount)}
-                for timestamp, amount in dividend_series.sort_index(ascending=False)
-                .head(100)
-                .items()
-            ]
+            dividends = []
+            if dividend_series is not None and not dividend_series.empty:
+                dividends = [
+                    {
+                        "date": timestamp.date().isoformat(),
+                        "amount": _json_value(amount),
+                    }
+                    for timestamp, amount in dividend_series.sort_index(ascending=False)
+                    .head(100)
+                    .items()
+                ]
 
         if selected_action_type in {"all", "splits"}:
             split_series = stock.splits
-            splits = [
-                {"date": timestamp.date().isoformat(), "ratio": _json_value(ratio)}
-                for timestamp, ratio in split_series.sort_index(ascending=False)
-                .head(100)
-                .items()
-            ]
+            splits = []
+            if split_series is not None and not split_series.empty:
+                splits = [
+                    {"date": timestamp.date().isoformat(), "ratio": _json_value(ratio)}
+                    for timestamp, ratio in split_series.sort_index(ascending=False)
+                    .head(100)
+                    .items()
+                ]
 
         return {"ticker": symbol, "dividends": dividends, "splits": splits}
     except Exception as exc:
@@ -330,7 +350,7 @@ def get_corporate_actions(ticker: str, action_type: str = "all") -> dict:
         open_world_hint=True,
     ),
 )
-def get_holders(ticker: str, holder_type: str = "major") -> dict:
+def get_holders(ticker: str = "", holder_type: str = "major") -> dict:
     """Return holder or insider-transaction data from Yahoo Finance.
 
     Institutional holders and insider transactions are limited to the top 20
@@ -341,8 +361,8 @@ def get_holders(ticker: str, holder_type: str = "major") -> dict:
         "institutional": "institutional_holders",
         "insider_transactions": "insider_transactions",
     }
-    symbol = ticker.strip().upper()
-    selected_holder_type = holder_type.strip().lower()
+    symbol = _normalize_text(ticker).upper()
+    selected_holder_type = _normalize_text(holder_type).lower()
 
     if not symbol:
         return {"error": "Please provide a ticker symbol."}
@@ -355,7 +375,10 @@ def get_holders(ticker: str, holder_type: str = "major") -> dict:
         }
 
     try:
-        holder_data = getattr(yf.Ticker(symbol), holder_attributes[selected_holder_type])
+        stock = yf.Ticker(symbol)
+        if ticker_error := _ticker_validation_error(stock, symbol):
+            return ticker_error
+        holder_data = getattr(stock, holder_attributes[selected_holder_type])
         data = []
         if holder_data is not None and not holder_data.empty:
             if selected_holder_type in {"institutional", "insider_transactions"}:
@@ -384,7 +407,7 @@ def get_holders(ticker: str, holder_type: str = "major") -> dict:
         open_world_hint=True,
     ),
 )
-def get_sector_data(key: str, level: str = "sector") -> dict:
+def get_sector_data(key: str = "", level: str = "sector") -> dict:
     """Return a Yahoo Finance sector or industry overview and top companies.
 
     Valid sector key examples include ``technology``, ``financial-services``,
@@ -399,8 +422,8 @@ def get_sector_data(key: str, level: str = "sector") -> dict:
         for industries in SECTOR_INDUSTY_MAPPING_LC.values()
         for industry in industries
     }
-    selected_key = key.strip().lower()
-    selected_level = level.strip().lower()
+    selected_key = _normalize_text(key).lower()
+    selected_level = _normalize_text(level).lower()
 
     if not selected_key:
         return {"error": "Please provide a sector or industry key."}
@@ -475,7 +498,7 @@ def get_stock_screener(screen_name: str = "day_gainers") -> dict:
     Results are limited to the top 25 entries, so additional matches may be
     truncated.
     """
-    selected_screen = screen_name.strip().lower()
+    selected_screen = _normalize_text(screen_name).lower()
     valid_screens = set(yf.PREDEFINED_SCREENER_QUERIES)
     if selected_screen not in valid_screens:
         return {
@@ -516,18 +539,21 @@ def get_stock_screener(screen_name: str = "day_gainers") -> dict:
         open_world_hint=True,
     ),
 )
-def get_news(ticker: str) -> dict:
+def get_news(ticker: str = "") -> dict:
     """Return the 10 most recent Yahoo Finance news items for a ticker.
 
     Results are limited to 10 items, so older news may be truncated.
     """
-    symbol = ticker.strip().upper()
+    symbol = _normalize_text(ticker).upper()
     if not symbol:
         return {"error": "Please provide a ticker symbol."}
 
     try:
+        stock = yf.Ticker(symbol)
+        if ticker_error := _ticker_validation_error(stock, symbol):
+            return ticker_error
         items = []
-        for raw_item in (yf.Ticker(symbol).news or [])[:10]:
+        for raw_item in (stock.news or [])[:10]:
             content = raw_item.get("content") or raw_item
             provider = content.get("provider") or {}
             link_data = content.get("canonicalUrl") or content.get("clickThroughUrl")
@@ -557,14 +583,17 @@ def get_news(ticker: str) -> dict:
         open_world_hint=True,
     ),
 )
-def get_sustainability(ticker: str) -> dict:
+def get_sustainability(ticker: str = "") -> dict:
     """Return available Yahoo Finance ESG and sustainability scores."""
-    symbol = ticker.strip().upper()
+    symbol = _normalize_text(ticker).upper()
     if not symbol:
         return {"error": "Please provide a ticker symbol."}
 
     try:
-        sustainability = yf.Ticker(symbol).sustainability
+        stock = yf.Ticker(symbol)
+        if ticker_error := _ticker_validation_error(stock, symbol):
+            return ticker_error
+        sustainability = stock.sustainability
         if sustainability is None or sustainability.empty:
             return {
                 "ticker": symbol,
