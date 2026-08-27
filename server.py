@@ -3,6 +3,7 @@
 import os
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timezone
 from math import isnan
 from typing import Any
@@ -965,6 +966,149 @@ def check_journal_legitimacy(journal_name_or_issn: str = "") -> dict:
         }
     except Exception as exc:
         return {"error": f"Could not check the DOAJ directory: {exc}"}
+
+
+def _market_snapshot_for_ticker(raw_ticker: Any) -> dict:
+    """Fetch one market snapshot entry without failing its surrounding batch."""
+    symbol = _normalize_text(raw_ticker).upper()
+    if not symbol:
+        return {
+            "ticker": raw_ticker if isinstance(raw_ticker, str) else None,
+            "error": "Please provide a non-empty ticker symbol.",
+        }
+    try:
+        quote_result = get_stock_quote(symbol)
+        if quote_result.get("error"):
+            return {"ticker": symbol, "error": quote_result["error"]}
+        return {
+            "ticker": symbol,
+            "current_price": quote_result.get("current_price"),
+            "market_cap": quote_result.get("market_cap"),
+        }
+    except Exception as exc:
+        return {"ticker": symbol, "error": f"Could not fetch market data: {exc}"}
+
+
+@mcp.tool(
+    title="Get Market Snapshot",
+    annotations=ToolAnnotations(
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
+    ),
+)
+def get_market_snapshot(tickers: list[str] = None) -> dict:
+    """Return concurrent price and market-cap snapshots for up to 25 tickers.
+
+    Results are limited to 25 tickers. Successful entries are ranked by market
+    cap descending, followed by any per-ticker error entries.
+    """
+    if not isinstance(tickers, list) or not tickers:
+        return {"error": "Please provide a non-empty list of ticker symbols."}
+    if len(tickers) > 25:
+        return {"error": "Too many tickers. Provide at most 25 ticker symbols."}
+
+    entries = []
+    with ThreadPoolExecutor(max_workers=len(tickers)) as executor:
+        futures = {
+            executor.submit(_market_snapshot_for_ticker, ticker): index
+            for index, ticker in enumerate(tickers)
+        }
+        indexed_results = {}
+        for future in as_completed(futures):
+            index = futures[future]
+            try:
+                indexed_results[index] = future.result()
+            except Exception as exc:
+                raw_ticker = tickers[index]
+                indexed_results[index] = {
+                    "ticker": _normalize_text(raw_ticker).upper() or None,
+                    "error": f"Could not fetch market data: {exc}",
+                }
+        entries = [indexed_results[index] for index in range(len(tickers))]
+
+    successful = [entry for entry in entries if "error" not in entry]
+    failed = [entry for entry in entries if "error" in entry]
+    successful.sort(
+        key=lambda entry: (
+            entry["market_cap"]
+            if isinstance(entry.get("market_cap"), (int, float))
+            else float("-inf")
+        ),
+        reverse=True,
+    )
+    return {"results": successful + failed}
+
+
+def _finance_research_for_entity(entity: Any, limit: int) -> dict:
+    """Run one existing OpenAlex search without failing its surrounding batch."""
+    normalized_entity = _normalize_text(entity)
+    if not normalized_entity:
+        return {
+            "entity": entity if isinstance(entity, str) else None,
+            "error": "Please provide a non-empty company name or topic.",
+        }
+    try:
+        result = search_finance_research(normalized_entity, limit=limit)
+        if result.get("error"):
+            return {"entity": normalized_entity, "error": result["error"]}
+        return {
+            "entity": normalized_entity,
+            "results": (result.get("results") or [])[:limit],
+        }
+    except Exception as exc:
+        return {"entity": normalized_entity, "error": f"Could not search OpenAlex: {exc}"}
+
+
+@mcp.tool(
+    title="Search Finance Research Batch",
+    annotations=ToolAnnotations(
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
+    ),
+)
+def search_finance_research_batch(
+    entities: list[str] = None, limit_per_entity: int = 10
+) -> dict:
+    """Search OpenAlex concurrently for up to 10 companies or topics.
+
+    Each entity is limited to at most 50 results according to
+    ``limit_per_entity``, so additional matches may be truncated.
+    """
+    if not isinstance(entities, list) or not entities:
+        return {"error": "Please provide a non-empty list of companies or topics."}
+    if len(entities) > 10:
+        return {"error": "Too many entities. Provide at most 10 companies or topics."}
+    if (
+        isinstance(limit_per_entity, bool)
+        or not isinstance(limit_per_entity, int)
+        or not 1 <= limit_per_entity <= 50
+    ):
+        return {
+            "error": "Invalid limit_per_entity. Provide an integer from 1 through 50."
+        }
+
+    with ThreadPoolExecutor(max_workers=len(entities)) as executor:
+        futures = {
+            executor.submit(_finance_research_for_entity, entity, limit_per_entity): index
+            for index, entity in enumerate(entities)
+        }
+        indexed_results = {}
+        for future in as_completed(futures):
+            index = futures[future]
+            try:
+                indexed_results[index] = future.result()
+            except Exception as exc:
+                raw_entity = entities[index]
+                indexed_results[index] = {
+                    "entity": _normalize_text(raw_entity) or None,
+                    "error": f"Could not search OpenAlex: {exc}",
+                }
+
+    return {"results": [indexed_results[index] for index in range(len(entities))]}
 
 
 if __name__ == "__main__":
