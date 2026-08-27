@@ -5,6 +5,7 @@ from typing import Any
 
 import yfinance as yf
 from mcp.server.mcpserver import MCPServer, Context
+from mcp.types import ToolAnnotations
 
 
 mcp = MCPServer("finance-data-server")
@@ -15,7 +16,17 @@ def _json_value(value: Any) -> Any:
     return value.item() if hasattr(value, "item") else value
 
 
-@mcp.tool()
+# All tools on this server are read-only data lookups. Use this annotations
+# pattern for every tool added here so clients classify them correctly.
+@mcp.tool(
+    title="Get Stock Quote",
+    annotations=ToolAnnotations(
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
+    ),
+)
 def get_stock_quote(ticker: str) -> dict:
     """Return the latest public Yahoo Finance quote for a ticker symbol."""
     symbol = ticker.strip().upper()
