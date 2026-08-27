@@ -1,11 +1,12 @@
 """A small MCP server that exposes public Yahoo Finance market data."""
 
 import os
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from math import isnan
 from typing import Any
 
 import yfinance as yf
+from yfinance.const import SECTOR_INDUSTY_MAPPING_LC
 from mcp.server.mcpserver import MCPServer, Context
 from mcp.types import ToolAnnotations
 
@@ -23,6 +24,19 @@ def _json_value(value: Any) -> Any:
     if isinstance(converted, float) and isnan(converted):
         return None
     return converted
+
+
+def _iso_datetime(value: Any) -> str | None:
+    """Convert Yahoo timestamps or date strings to an ISO-formatted string."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value, tz=timezone.utc).isoformat().replace(
+            "+00:00", "Z"
+        )
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    return str(value)
 
 
 # All tools on this server are read-only data lookups. Use this annotations
@@ -359,6 +373,222 @@ def get_holders(ticker: str, holder_type: str = "major") -> dict:
         return {"ticker": symbol, "holder_type": selected_holder_type, "data": data}
     except Exception as exc:
         return {"error": f"Could not fetch holder data for ticker '{symbol}': {exc}"}
+
+
+@mcp.tool(
+    title="Get Sector Data",
+    annotations=ToolAnnotations(
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
+    ),
+)
+def get_sector_data(key: str, level: str = "sector") -> dict:
+    """Return a Yahoo Finance sector or industry overview and top companies.
+
+    Valid sector key examples include ``technology``, ``financial-services``,
+    and ``healthcare``. Valid industry examples include ``semiconductors``,
+    ``computer-hardware``, and ``solar``. Companies are limited to the top 15,
+    so additional companies may be truncated.
+    """
+    valid_levels = {"sector", "industry"}
+    sector_keys = set(SECTOR_INDUSTY_MAPPING_LC)
+    industry_keys = {
+        industry
+        for industries in SECTOR_INDUSTY_MAPPING_LC.values()
+        for industry in industries
+    }
+    selected_key = key.strip().lower()
+    selected_level = level.strip().lower()
+
+    if not selected_key:
+        return {"error": "Please provide a sector or industry key."}
+    if selected_level not in valid_levels:
+        return {
+            "error": (
+                f"Invalid level '{level}'. Valid levels are: "
+                f"{', '.join(sorted(valid_levels))}."
+            )
+        }
+
+    valid_keys = sector_keys if selected_level == "sector" else industry_keys
+    if selected_key not in valid_keys:
+        examples = (
+            "technology, financial-services, healthcare"
+            if selected_level == "sector"
+            else "semiconductors, computer-hardware, solar"
+        )
+        return {
+            "error": (
+                f"Invalid {selected_level} key '{key}'. Examples of valid keys are: "
+                f"{examples}."
+            )
+        }
+
+    try:
+        domain = (
+            yf.Sector(selected_key)
+            if selected_level == "sector"
+            else yf.Industry(selected_key)
+        )
+        overview = {
+            "name": domain.name,
+            **{str(field): _json_value(value) for field, value in domain.overview.items()},
+        }
+        companies = []
+        top_companies = domain.top_companies
+        if top_companies is not None and not top_companies.empty:
+            for ticker_symbol, row in top_companies.head(15).iterrows():
+                companies.append(
+                    {
+                        "ticker": str(ticker_symbol),
+                        "name": _json_value(row.get("name")),
+                        "market_weight": _json_value(row.get("market weight")),
+                    }
+                )
+
+        return {
+            "key": selected_key,
+            "level": selected_level,
+            "overview": overview,
+            "companies": companies,
+        }
+    except Exception as exc:
+        return {
+            "error": f"Could not fetch {selected_level} data for key '{selected_key}': {exc}"
+        }
+
+
+@mcp.tool(
+    title="Get Stock Screener",
+    annotations=ToolAnnotations(
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
+    ),
+)
+def get_stock_screener(screen_name: str = "day_gainers") -> dict:
+    """Return results from a predefined Yahoo Finance stock screener.
+
+    Results are limited to the top 25 entries, so additional matches may be
+    truncated.
+    """
+    selected_screen = screen_name.strip().lower()
+    valid_screens = set(yf.PREDEFINED_SCREENER_QUERIES)
+    if selected_screen not in valid_screens:
+        return {
+            "error": (
+                f"Invalid screen_name '{screen_name}'. Valid screens are: "
+                f"{', '.join(sorted(valid_screens))}."
+            )
+        }
+
+    try:
+        response = yf.screen(selected_screen, count=25)
+        results = []
+        for quote in response.get("quotes", [])[:25]:
+            results.append(
+                {
+                    "ticker": quote.get("symbol"),
+                    "name": quote.get("longName") or quote.get("shortName"),
+                    "price": _json_value(quote.get("regularMarketPrice")),
+                    "change": _json_value(quote.get("regularMarketChange")),
+                    "percent_change": _json_value(
+                        quote.get("regularMarketChangePercent")
+                    ),
+                    "volume": _json_value(quote.get("regularMarketVolume")),
+                    "market_cap": _json_value(quote.get("marketCap")),
+                }
+            )
+        return {"screen_name": selected_screen, "results": results}
+    except Exception as exc:
+        return {"error": f"Could not run stock screener '{selected_screen}': {exc}"}
+
+
+@mcp.tool(
+    title="Get News",
+    annotations=ToolAnnotations(
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
+    ),
+)
+def get_news(ticker: str) -> dict:
+    """Return the 10 most recent Yahoo Finance news items for a ticker.
+
+    Results are limited to 10 items, so older news may be truncated.
+    """
+    symbol = ticker.strip().upper()
+    if not symbol:
+        return {"error": "Please provide a ticker symbol."}
+
+    try:
+        items = []
+        for raw_item in (yf.Ticker(symbol).news or [])[:10]:
+            content = raw_item.get("content") or raw_item
+            provider = content.get("provider") or {}
+            link_data = content.get("canonicalUrl") or content.get("clickThroughUrl")
+            link = link_data.get("url") if isinstance(link_data, dict) else link_data
+            items.append(
+                {
+                    "title": content.get("title"),
+                    "publisher": provider.get("displayName")
+                    or content.get("publisher"),
+                    "link": link or content.get("link"),
+                    "published_time": _iso_datetime(
+                        content.get("pubDate") or content.get("providerPublishTime")
+                    ),
+                }
+            )
+        return {"ticker": symbol, "news": items}
+    except Exception as exc:
+        return {"error": f"Could not fetch news for ticker '{symbol}': {exc}"}
+
+
+@mcp.tool(
+    title="Get Sustainability",
+    annotations=ToolAnnotations(
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
+    ),
+)
+def get_sustainability(ticker: str) -> dict:
+    """Return available Yahoo Finance ESG and sustainability scores."""
+    symbol = ticker.strip().upper()
+    if not symbol:
+        return {"error": "Please provide a ticker symbol."}
+
+    try:
+        sustainability = yf.Ticker(symbol).sustainability
+        if sustainability is None or sustainability.empty:
+            return {
+                "ticker": symbol,
+                "message": f"No sustainability data is available for ticker '{symbol}'.",
+                "data": {},
+            }
+
+        scores = {}
+        if len(sustainability.columns) == 1:
+            value_column = sustainability.columns[0]
+            scores = {
+                str(score): _json_value(value)
+                for score, value in sustainability[value_column].items()
+            }
+        else:
+            for score, row in sustainability.iterrows():
+                for column, value in row.items():
+                    scores[f"{score} ({column})"] = _json_value(value)
+
+        return {"ticker": symbol, "data": scores}
+    except Exception as exc:
+        return {
+            "error": f"Could not fetch sustainability data for ticker '{symbol}': {exc}"
+        }
 
 
 if __name__ == "__main__":
