@@ -3,6 +3,8 @@
 import os
 import json
 import re
+from functools import wraps
+from inspect import signature
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timezone
 from math import isnan
@@ -19,6 +21,186 @@ from mcp.types import ToolAnnotations
 
 
 mcp = MCPServer("finance-data-server")
+
+
+FALLBACK_SOURCES = {
+    "financial_statements": {
+        "recommended_source": "SEC EDGAR Companyfacts and issuer filings",
+        "reason": "The primary source did not supply all requested reported accounting data.",
+        "suggested_sources": [
+            {"source": "SEC Companyfacts", "purpose": "Standardized reported accounting facts"},
+            {"source": "10-K/10-Q filings", "purpose": "Authoritative filed statements and notes"},
+            {"source": "Investor relations", "purpose": "Official annual reports and earnings releases"},
+        ],
+    },
+    "ownership": {
+        "recommended_source": "SEC EDGAR",
+        "reason": "The primary source returned no usable ownership observations.",
+        "suggested_filings": [
+            {"form": "DEF 14A", "purpose": "Major beneficial owners, directors and executive ownership"},
+            {"form": "13F-HR", "purpose": "Quarterly institutional-manager positions"},
+            {"form": "13D/13G", "purpose": "Reportable beneficial ownership positions and changes"},
+            {"form": "3/4/5", "purpose": "Insider ownership changes and transactions"},
+        ],
+    },
+    "corporate_actions": {
+        "recommended_source": "Issuer and exchange disclosures",
+        "reason": "The primary source did not supply all requested corporate actions.",
+        "suggested_sources": [
+            {"source": "SEC 8-K", "purpose": "Material corporate-action disclosures"},
+            {"source": "Investor relations", "purpose": "Official issuer announcements"},
+            {"source": "Exchange notices", "purpose": "Official exchange action notices"},
+        ],
+    },
+    "literature": {
+        "recommended_source": "Crossref or publisher records",
+        "reason": "The primary literature source did not supply all requested records.",
+        "suggested_sources": [
+            {"source": "Crossref", "purpose": "DOI and publication metadata"},
+            {"source": "Publisher record", "purpose": "Authoritative article metadata"},
+            {"source": "Recognised repository", "purpose": "Stable manuscript or preprint record"},
+        ],
+    },
+    "prices": {
+        "recommended_source": "Official exchange data",
+        "reason": "The primary source did not supply all requested price observations.",
+        "suggested_sources": [
+            {"source": "Official exchange", "purpose": "Authoritative trade and quote history"},
+            {"source": "Reputable market-data vendor", "purpose": "Price history with adjustment methodology stated"},
+        ],
+    },
+}
+
+
+def _coverage_tool(data_type: str, provider: str, collection: str | None = None, limit: int | None = None):
+    """Add a uniform coverage contract without changing existing response fields."""
+    def decorate(function):
+        function_signature = signature(function)
+
+        @wraps(function)
+        def wrapped(*args, **kwargs):
+            bound = function_signature.bind_partial(*args, **kwargs)
+            bound.apply_defaults()
+            requested = {key: value for key, value in bound.arguments.items() if value is not None}
+            if "ticker" in requested:
+                requested["tickers"] = [str(requested.pop("ticker")).strip().upper()]
+            requested["data_type"] = data_type
+
+            response = function(*args, **kwargs)
+            if not isinstance(response, dict):
+                return response
+
+            error = response.get("error")
+            validation = bool(error and error.startswith(("Please ", "Invalid ", "Too many ")))
+            unsupported = bool(error and error.startswith("Unsupported "))
+            rows = response.get(collection) if collection else None
+            if data_type == "corporate_actions":
+                rows = (response.get("dividends") or []) + (response.get("splits") or [])
+            row_count = len(rows) if isinstance(rows, (list, dict)) else (1 if not error else 0)
+            missing_value_fields = [
+                key for key, value in response.items()
+                if value is None and key not in {"message"}
+            ]
+            if isinstance(rows, list):
+                missing_value_fields.extend(
+                    key
+                    for row in rows if isinstance(row, dict)
+                    for key, value in row.items() if value is None
+                )
+            missing_value_fields = sorted(set(missing_value_fields))
+            status = "complete"
+            if unsupported:
+                status = "not_supported"
+            elif error:
+                status = "unavailable"
+            elif isinstance(rows, (list, dict)) and not rows:
+                status = "unavailable"
+            elif isinstance(rows, list) and any(isinstance(row, dict) and row.get("error") for row in rows):
+                status = "partial" if any(isinstance(row, dict) and not row.get("error") for row in rows) else "unavailable"
+            elif limit is not None and isinstance(rows, list) and len(rows) >= limit:
+                status = "truncated"
+            elif missing_value_fields:
+                status = "partial"
+            if data_type == "journal_directory" and response.get("found") is False:
+                status = "unavailable"
+            if data_type == "corporate_actions" and not error:
+                action_type = requested.get("action_type", "all")
+                requested_fields = ["dividends", "splits"] if action_type == "all" else [action_type]
+                present_fields = [field for field in requested_fields if response.get(field)]
+                if not present_fields:
+                    status = "unavailable"
+                elif len(present_fields) < len(requested_fields):
+                    status = "partial"
+                if any(len(response.get(field) or []) >= 100 for field in requested_fields):
+                    status = "truncated"
+
+            returned = {"row_count": row_count}
+            if response.get("ticker"):
+                returned["tickers"] = [response["ticker"]]
+            if isinstance(rows, list):
+                periods = [row.get("period_ending") or row.get("date") for row in rows if isinstance(row, dict)]
+                returned["periods"] = [value for value in periods if value]
+            missing = {}
+            if status in {"unavailable", "not_supported"}:
+                missing["fields"] = [data_type]
+                if data_type == "ownership":
+                    holder_type = requested.get("holder_type", "major")
+                    missing["fields"] = [
+                        f"{holder_type}_holders"
+                        if holder_type in {"major", "institutional"}
+                        else holder_type
+                    ]
+                if requested.get("tickers"):
+                    missing["tickers"] = requested["tickers"]
+            elif status == "partial" and data_type == "corporate_actions":
+                missing["fields"] = [
+                    field for field in requested_fields if not response.get(field)
+                ]
+            elif status == "partial":
+                missing["fields"] = missing_value_fields
+            elif status == "truncated":
+                missing["reason"] = "The connector limit may have excluded additional observations."
+
+            response["coverage_audit"] = {
+                "status": status,
+                "requested": requested,
+                "returned": returned,
+                "missing": missing,
+                "primary_source": {
+                    "provider": provider,
+                    "retrieval_method": "Finance Data and Lit MCP",
+                    "status": "primary_workflow_source",
+                    "retrieval_date": date.today().isoformat(),
+                },
+            }
+            if validation:
+                response["error_type"] = "validation"
+            if status != "complete":
+                fallback = FALLBACK_SOURCES.get(data_type)
+                if fallback:
+                    response["fallback_recommendation"] = {
+                        "available": True,
+                        "requires_user_confirmation": True,
+                        "source_status": "supplementary",
+                        **fallback,
+                        "suggested_user_prompt": (
+                            "Finance Data and Lit could not fully supply the requested "
+                            f"{data_type.replace('_', ' ')} data. Would you like me to continue "
+                            f"using {fallback['recommended_source']} as a supplementary source?"
+                        ),
+                    }
+                else:
+                    response["fallback_recommendation"] = {
+                        "available": False,
+                        "requires_user_confirmation": True,
+                        "source_status": "supplementary",
+                        "recommended_source": None,
+                        "reason": "No narrower authoritative supplementary source is configured for this data type.",
+                    }
+            return response
+
+        return wrapped
+    return decorate
 
 
 def _json_value(value: Any) -> Any:
@@ -135,6 +317,7 @@ def _openalex_authors(work: dict) -> list[str]:
         open_world_hint=True,
     ),
 )
+@_coverage_tool("prices", "Yahoo Finance")
 def get_stock_quote(ticker: str = "") -> dict:
     """Return the latest public Yahoo Finance quote for a ticker symbol."""
     symbol = _normalize_text(ticker).upper()
@@ -190,6 +373,7 @@ def get_stock_quote(ticker: str = "") -> dict:
         open_world_hint=True,
     ),
 )
+@_coverage_tool("prices", "Yahoo Finance", "prices", 250)
 def get_historical_prices(
     ticker: str = "", period: str = "1mo", interval: str = "1d"
 ) -> dict:
@@ -275,6 +459,7 @@ def get_historical_prices(
         open_world_hint=True,
     ),
 )
+@_coverage_tool("financial_statements", "Yahoo Finance", "data", 8)
 def get_financial_statements(
     ticker: str = "", statement: str = "income", period: str = "annual"
 ) -> dict:
@@ -352,6 +537,7 @@ def get_financial_statements(
         open_world_hint=True,
     ),
 )
+@_coverage_tool("corporate_actions", "Yahoo Finance", limit=200)
 def get_corporate_actions(ticker: str = "", action_type: str = "all") -> dict:
     """Return dividends and stock splits from Yahoo Finance.
 
@@ -420,6 +606,7 @@ def get_corporate_actions(ticker: str = "", action_type: str = "all") -> dict:
         open_world_hint=True,
     ),
 )
+@_coverage_tool("ownership", "Yahoo Finance", "data", 20)
 def get_holders(ticker: str = "", holder_type: str = "major") -> dict:
     """Return holder or insider-transaction data from Yahoo Finance.
 
@@ -436,6 +623,10 @@ def get_holders(ticker: str = "", holder_type: str = "major") -> dict:
 
     if not symbol:
         return {"error": "Please provide a ticker symbol."}
+    if selected_holder_type in {"historical", "historical_ownership"}:
+        return {
+            "error": "Unsupported holder_type: Yahoo Finance does not provide point-in-time historical ownership through this tool."
+        }
     if selected_holder_type not in holder_attributes:
         return {
             "error": (
@@ -477,6 +668,7 @@ def get_holders(ticker: str = "", holder_type: str = "major") -> dict:
         open_world_hint=True,
     ),
 )
+@_coverage_tool("market_classification", "Yahoo Finance", "companies", 15)
 def get_sector_data(key: str = "", level: str = "sector") -> dict:
     """Return a Yahoo Finance sector or industry overview and top companies.
 
@@ -562,6 +754,7 @@ def get_sector_data(key: str = "", level: str = "sector") -> dict:
         open_world_hint=True,
     ),
 )
+@_coverage_tool("market_screen", "Yahoo Finance", "results", 25)
 def get_stock_screener(screen_name: str = "day_gainers") -> dict:
     """Return results from a predefined Yahoo Finance stock screener.
 
@@ -609,6 +802,7 @@ def get_stock_screener(screen_name: str = "day_gainers") -> dict:
         open_world_hint=True,
     ),
 )
+@_coverage_tool("news", "Yahoo Finance", "news", 10)
 def get_news(ticker: str = "") -> dict:
     """Return the 10 most recent Yahoo Finance news items for a ticker.
 
@@ -653,6 +847,7 @@ def get_news(ticker: str = "") -> dict:
         open_world_hint=True,
     ),
 )
+@_coverage_tool("sustainability", "Yahoo Finance", "data")
 def get_sustainability(ticker: str = "") -> dict:
     """Return available Yahoo Finance ESG and sustainability scores."""
     symbol = _normalize_text(ticker).upper()
@@ -699,6 +894,7 @@ def get_sustainability(ticker: str = "") -> dict:
         open_world_hint=True,
     ),
 )
+@_coverage_tool("literature", "OpenAlex", "results", 50)
 def search_finance_research(
     query: str = "", year_from: int = None, limit: int = 10
 ) -> dict:
@@ -775,6 +971,7 @@ def search_finance_research(
         open_world_hint=True,
     ),
 )
+@_coverage_tool("literature", "OpenAlex")
 def get_research_paper(doi_or_openalex_id: str = "") -> dict:
     """Return full OpenAlex details for one DOI or OpenAlex work ID."""
     identifier = _normalize_text(doi_or_openalex_id)
@@ -849,6 +1046,7 @@ def get_research_paper(doi_or_openalex_id: str = "") -> dict:
         open_world_hint=True,
     ),
 )
+@_coverage_tool("literature", "arXiv", "results", 50)
 def search_finance_preprints(query: str = "", limit: int = 10) -> dict:
     """Search arXiv quantitative-finance and economics preprints.
 
@@ -924,6 +1122,7 @@ def search_finance_preprints(query: str = "", limit: int = 10) -> dict:
         open_world_hint=True,
     ),
 )
+@_coverage_tool("journal_directory", "DOAJ")
 def check_journal_legitimacy(journal_name_or_issn: str = "") -> dict:
     """Check whether a journal is listed in DOAJ's vetted directory."""
     search_value = _normalize_text(journal_name_or_issn)
@@ -998,6 +1197,7 @@ def _market_snapshot_for_ticker(raw_ticker: Any) -> dict:
         open_world_hint=True,
     ),
 )
+@_coverage_tool("prices", "Yahoo Finance", "results")
 def get_market_snapshot(tickers: list[str] = None) -> dict:
     """Return concurrent price and market-cap snapshots for up to 25 tickers.
 
@@ -1070,6 +1270,7 @@ def _finance_research_for_entity(entity: Any, limit: int) -> dict:
         open_world_hint=True,
     ),
 )
+@_coverage_tool("literature", "OpenAlex", "results")
 def search_finance_research_batch(
     entities: list[str] = None, limit_per_entity: int = 10
 ) -> dict:

@@ -96,7 +96,9 @@ class ResearchToolTests(unittest.TestCase):
 
         with patch.object(server, "_research_http_get_json", return_value={"results": []}):
             missing = server.check_journal_legitimacy("Definitely Not A Journal")
-        self.assertEqual(missing, {"query": "Definitely Not A Journal", "found": False})
+        self.assertEqual(missing["query"], "Definitely Not A Journal")
+        self.assertFalse(missing["found"])
+        self.assertEqual(missing["coverage_audit"]["status"], "unavailable")
 
     def test_empty_and_invalid_inputs_return_structured_errors(self):
         cases = [
@@ -123,9 +125,10 @@ class ResearchToolTests(unittest.TestCase):
         with patch.object(server, "_research_http_get_json", side_effect=error):
             result = server.get_research_paper("W999999999999999")
         self.assertEqual(
-            result,
-            {"error": "No OpenAlex work found for 'W999999999999999'."},
+            result["error"],
+            "No OpenAlex work found for 'W999999999999999'.",
         )
+        self.assertEqual(result["coverage_audit"]["status"], "unavailable")
 
     def test_network_failures_return_structured_errors(self):
         failure = server._ResearchAPIError("timed out")
