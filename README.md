@@ -5,6 +5,17 @@ and finance literature. Yahoo Finance is the primary market-data provider;
 OpenAlex, arXiv, and DOAJ provide research and journal-directory records. The
 server uses Streamable HTTP transport.
 
+## Canonical repository
+
+The canonical GitHub repository is
+[`redzabdullah/Finance-Open-Resource`](https://github.com/redzabdullah/Finance-Open-Resource).
+
+Clone it with:
+
+```bash
+git clone https://github.com/redzabdullah/Finance-Open-Resource.git
+```
+
 ## Tools
 
 Market tools: `get_stock_quote`, `get_historical_prices`,
