@@ -5,6 +5,16 @@ and finance literature. Yahoo Finance is the primary market-data provider;
 OpenAlex, arXiv, and DOAJ provide research and journal-directory records. The
 server uses Streamable HTTP transport.
 
+## Data sources
+
+| Source | Purpose |
+| --- | --- |
+| Yahoo Finance | Primary public market quotes, history, company data, news, and screeners |
+| Alpha Vantage | Separate opt-in quotes, technical indicators, FX, crypto, macroeconomic data, and news sentiment |
+| OpenAlex | Published finance, business, economics, and accounting research |
+| arXiv | Quantitative-finance and economics preprints |
+| DOAJ | Vetted open-access journal directory checks |
+
 ## Canonical repository
 
 The canonical GitHub repository is
@@ -26,6 +36,23 @@ Market tools: `get_stock_quote`, `get_historical_prices`,
 Research tools: `search_finance_research`, `get_research_paper`,
 `search_finance_preprints`, `check_journal_legitimacy`, and
 `search_finance_research_batch`.
+
+### Alpha Vantage tools
+
+Alpha Vantage is exposed through distinct tools and is never blended into the
+Yahoo Finance tools automatically:
+
+- `get_stock_quote_av`
+- `get_technical_indicator_av` (SMA, EMA, RSI, MACD, and BBANDS)
+- `get_forex_rate_av`
+- `get_crypto_quote_av`
+- `get_economic_indicator_av`
+- `get_news_sentiment_av`
+
+All Alpha Vantage tools share one in-memory free-tier quota tracker: at most 25
+requests per 24 hours and five requests in a rolling 60-second window. The
+server rejects an exhausted request before any HTTP call and reports when quota
+capacity resets. Counters are process-local and restart with the server.
 
 ## Coverage contract
 
@@ -91,6 +118,26 @@ Install the dependencies:
 ```bash
 python -m pip install -r requirements.txt
 ```
+
+To use the separate Alpha Vantage tools, obtain an Alpha Vantage API key and
+set it in the server environment. It is read only when an `_av` tool is called:
+
+```powershell
+$env:ALPHA_VANTAGE_API_KEY = "your-api-key"
+```
+
+Do not commit API keys or `.env` files; both `.env` and `.env.*` are ignored by
+Git.
+
+### Optional Yahoo-to-Alpha-Vantage fallback
+
+When `get_stock_quote` receives partial or unavailable Yahoo Finance coverage,
+it may offer a separate Alpha Vantage lookup. Clients that declare MCP form
+elicitation support receive an accept/decline prompt explaining that the lookup
+uses one of the 25 daily requests. Alpha Vantage is called only after acceptance.
+Declining or cancelling leaves the Yahoo response unchanged. Clients without
+elicitation support receive the same prompt in `coverage_audit.suggestion` so
+they can relay it conversationally.
 
 ## Run the server
 

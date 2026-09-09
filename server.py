@@ -3,8 +3,9 @@
 import os
 import json
 import re
+import asyncio
 from functools import wraps
-from inspect import signature
+from inspect import isawaitable, signature
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timezone
 from math import isnan
@@ -15,12 +16,20 @@ from urllib.request import Request, urlopen
 from xml.etree import ElementTree
 
 import yfinance as yf
+from pydantic import BaseModel, Field
 from yfinance.const import SECTOR_INDUSTY_MAPPING_LC
-from mcp.server.mcpserver import MCPServer, Context
+from mcp import types as mcp_types
+from mcp.server.fastmcp import FastMCP, Context
 from mcp.types import ToolAnnotations
 
+from alphavantage_client import request as alphavantage_request
 
-mcp = MCPServer("finance-data-server")
+
+mcp = FastMCP(
+    "finance-data-server",
+    host="0.0.0.0",
+    port=int(os.getenv("PORT", 8000)),
+)
 
 
 FALLBACK_SOURCES = {
@@ -160,6 +169,11 @@ def _coverage_tool(data_type: str, provider: str, collection: str | None = None,
                 missing["fields"] = missing_value_fields
             elif status == "truncated":
                 missing["reason"] = "The connector limit may have excluded additional observations."
+            if response.get("error_type") == "quota_exhausted":
+                missing["reason"] = (
+                    f"Alpha Vantage {response.get('quota', 'shared')} limit was hit; "
+                    f"capacity resets at {response.get('resets_at', 'an unknown time')}."
+                )
 
             response["coverage_audit"] = {
                 "status": status,
@@ -308,17 +322,8 @@ def _openalex_authors(work: dict) -> list[str]:
 
 # All tools on this server are read-only data lookups. Use this annotations
 # pattern for every tool added here so clients classify them correctly.
-@mcp.tool(
-    title="Get Stock Quote",
-    annotations=ToolAnnotations(
-        read_only_hint=True,
-        destructive_hint=False,
-        idempotent_hint=True,
-        open_world_hint=True,
-    ),
-)
 @_coverage_tool("prices", "Yahoo Finance")
-def get_stock_quote(ticker: str = "") -> dict:
+def _get_stock_quote_yahoo(ticker: str = "") -> dict:
     """Return the latest public Yahoo Finance quote for a ticker symbol."""
     symbol = _normalize_text(ticker).upper()
     if not symbol:
@@ -362,6 +367,306 @@ def get_stock_quote(ticker: str = "") -> dict:
     except Exception as exc:
         # Keep network errors and malformed Yahoo responses from crashing MCP.
         return {"error": f"Could not fetch data for ticker '{symbol}': {exc}"}
+
+
+class AlphaVantageFallbackConfirmation(BaseModel):
+    """Form returned when a user accepts an Alpha Vantage fallback."""
+
+    use_alpha_vantage: bool = Field(
+        default=True,
+        description="Use one Alpha Vantage request to supplement the Yahoo Finance result.",
+    )
+
+
+def _client_supports_form_elicitation(ctx: Context | None) -> bool:
+    if ctx is None:
+        return False
+    try:
+        capability = mcp_types.ClientCapabilities(
+            elicitation=mcp_types.ElicitationCapability(
+                form=mcp_types.FormElicitationCapability()
+            )
+        )
+        return ctx.session.check_client_capability(capability)
+    except (AttributeError, RuntimeError):
+        return False
+
+
+async def _offer_av_fallback(
+    result: dict,
+    ctx: Context | None,
+    fallback,
+    gap: str,
+) -> dict:
+    """Offer an explicit, reusable Alpha Vantage supplementary lookup."""
+    audit = result.get("coverage_audit", {})
+    if audit.get("status") not in {"partial", "unavailable"}:
+        return result
+
+    message = (
+        f"Yahoo Finance doesn't have {gap}. Check Alpha Vantage instead? "
+        "Uses 1 of your 25 daily requests."
+    )
+    offer = {
+        "provider": "Alpha Vantage",
+        "message": message,
+        "requires_user_confirmation": True,
+    }
+    if not _client_supports_form_elicitation(ctx):
+        audit["suggestion"] = offer
+        return result
+
+    elicitation = await ctx.elicit(message, AlphaVantageFallbackConfirmation)
+    if (
+        elicitation.action != "accept"
+        or not getattr(elicitation, "data", None)
+        or not elicitation.data.use_alpha_vantage
+    ):
+        audit["alpha_vantage_offer"] = {
+            **offer,
+            "outcome": "declined" if elicitation.action == "decline" else "cancelled",
+        }
+        return result
+
+    supplementary = fallback()
+    if supplementary.get("error_type") == "quota_exhausted":
+        audit["status"] = "unavailable"
+        audit.setdefault("missing", {})["reason"] = supplementary["coverage_audit"][
+            "missing"
+        ]["reason"]
+        audit["alpha_vantage_offer"] = {**offer, "outcome": "accepted_quota_exhausted"}
+        result["alpha_vantage"] = supplementary
+        return result
+
+    if supplementary.get("error"):
+        audit["alpha_vantage_offer"] = {**offer, "outcome": "accepted_unavailable"}
+        result["alpha_vantage"] = supplementary
+        return result
+
+    result.pop("error", None)
+    result.pop("error_type", None)
+    for key, value in supplementary.items():
+        if key not in {"coverage_audit", "fallback_recommendation"} and result.get(key) is None:
+            result[key] = value
+    result["alpha_vantage"] = supplementary
+    audit["status"] = "complete"
+    audit["supplementary_source"] = {
+        "provider": "Alpha Vantage",
+        "source_status": "supplementary",
+        "filled_gap": gap,
+    }
+    audit["alpha_vantage_offer"] = {**offer, "outcome": "accepted_filled"}
+    return result
+
+
+@mcp.tool(
+    title="Get Stock Quote",
+    annotations=ToolAnnotations(
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
+    ),
+)
+async def get_stock_quote(ticker: str = "", ctx: Context | None = None) -> dict:
+    """Return a Yahoo quote and optionally offer Alpha Vantage for missing fields."""
+    result = _get_stock_quote_yahoo(ticker)
+    symbol = _normalize_text(ticker).upper()
+    missing = result.get("coverage_audit", {}).get("missing", {}).get("fields", [])
+    gap = ", ".join(missing) if missing else f"complete quote data for {symbol}"
+    return await _offer_av_fallback(
+        result,
+        ctx,
+        lambda: get_stock_quote_av(symbol),
+        gap,
+    )
+
+
+AV_TOOL_ANNOTATIONS = ToolAnnotations(
+    read_only_hint=True,
+    destructive_hint=False,
+    idempotent_hint=True,
+    open_world_hint=True,
+)
+
+
+def _av_request(params: dict[str, str]) -> dict:
+    try:
+        return alphavantage_request(params)
+    except Exception as exc:
+        return {"error": f"Could not fetch Alpha Vantage data: {exc}"}
+
+
+def _av_number(value: Any) -> float | None:
+    try:
+        return float(value) if value not in {None, "None", "-"} else None
+    except (TypeError, ValueError):
+        return None
+
+
+@mcp.tool(title="Get Stock Quote (Alpha Vantage)", annotations=AV_TOOL_ANNOTATIONS)
+@_coverage_tool("prices", "Alpha Vantage")
+def get_stock_quote_av(symbol: str = "") -> dict:
+    """Return a distinct Alpha Vantage global quote; consumes one shared AV request."""
+    ticker = _normalize_text(symbol).upper()
+    if not ticker:
+        return {"error": "Please provide a symbol."}
+    payload = _av_request({"function": "GLOBAL_QUOTE", "symbol": ticker})
+    if payload.get("error"):
+        return payload
+    quote = payload.get("Global Quote") or {}
+    if not quote:
+        return {"error": f"Alpha Vantage returned no quote for '{ticker}'."}
+    return {
+        "ticker": ticker,
+        "current_price": _av_number(quote.get("05. price")),
+        "previous_close": _av_number(quote.get("08. previous close")),
+        "day_high": _av_number(quote.get("03. high")),
+        "day_low": _av_number(quote.get("04. low")),
+        "volume": _av_number(quote.get("06. volume")),
+        "latest_trading_day": quote.get("07. latest trading day"),
+        "change": _av_number(quote.get("09. change")),
+        "change_percent": quote.get("10. change percent"),
+    }
+
+
+@mcp.tool(title="Get Technical Indicator (Alpha Vantage)", annotations=AV_TOOL_ANNOTATIONS)
+@_coverage_tool("technical_indicator", "Alpha Vantage", "values")
+def get_technical_indicator_av(
+    symbol: str = "",
+    indicator: str = "SMA",
+    interval: str = "daily",
+    time_period: int = 20,
+) -> dict:
+    """Return SMA, EMA, RSI, MACD, or BBANDS from Alpha Vantage."""
+    ticker = _normalize_text(symbol).upper()
+    selected = _normalize_text(indicator).upper()
+    valid = {"SMA", "EMA", "RSI", "MACD", "BBANDS"}
+    valid_intervals = {"1min", "5min", "15min", "30min", "60min", "daily", "weekly", "monthly"}
+    if not ticker:
+        return {"error": "Please provide a symbol."}
+    if selected not in valid:
+        return {"error": f"Invalid indicator. Choose one of: {', '.join(sorted(valid))}."}
+    if interval not in valid_intervals:
+        return {"error": "Invalid interval for Alpha Vantage technical indicators."}
+    if isinstance(time_period, bool) or not isinstance(time_period, int) or time_period < 1:
+        return {"error": "Invalid time_period. Provide a positive integer."}
+    params = {"function": selected, "symbol": ticker, "interval": interval, "series_type": "close"}
+    if selected != "MACD":
+        params["time_period"] = str(time_period)
+    payload = _av_request(params)
+    if payload.get("error"):
+        return payload
+    key = next((key for key in payload if key.startswith("Technical Analysis")), None)
+    observations = payload.get(key, {}) if key else {}
+    if not observations:
+        return {"error": f"Alpha Vantage returned no {selected} data for '{ticker}'."}
+    values = [
+        {"date": timestamp, **{name.lower().replace(" ", "_"): _av_number(value) for name, value in row.items()}}
+        for timestamp, row in list(observations.items())[:250]
+    ]
+    return {"ticker": ticker, "indicator": selected, "interval": interval, "values": values}
+
+
+@mcp.tool(title="Get Forex Rate (Alpha Vantage)", annotations=AV_TOOL_ANNOTATIONS)
+@_coverage_tool("forex_rate", "Alpha Vantage")
+def get_forex_rate_av(from_currency: str = "", to_currency: str = "") -> dict:
+    """Return an Alpha Vantage currency exchange rate."""
+    source = _normalize_text(from_currency).upper()
+    target = _normalize_text(to_currency).upper()
+    if not source or not target:
+        return {"error": "Please provide from_currency and to_currency."}
+    payload = _av_request({"function": "CURRENCY_EXCHANGE_RATE", "from_currency": source, "to_currency": target})
+    if payload.get("error"):
+        return payload
+    data = payload.get("Realtime Currency Exchange Rate") or {}
+    if not data:
+        return {"error": f"Alpha Vantage returned no exchange rate for {source}/{target}."}
+    return {
+        "from_currency": source,
+        "to_currency": target,
+        "exchange_rate": _av_number(data.get("5. Exchange Rate")),
+        "bid_price": _av_number(data.get("8. Bid Price")),
+        "ask_price": _av_number(data.get("9. Ask Price")),
+        "last_refreshed": data.get("6. Last Refreshed"),
+    }
+
+
+@mcp.tool(title="Get Crypto Quote (Alpha Vantage)", annotations=AV_TOOL_ANNOTATIONS)
+@_coverage_tool("crypto_quote", "Alpha Vantage")
+def get_crypto_quote_av(symbol: str = "", market: str = "USD") -> dict:
+    """Return a crypto-to-market exchange quote from Alpha Vantage."""
+    crypto = _normalize_text(symbol).upper()
+    target = _normalize_text(market).upper()
+    if not crypto or not target:
+        return {"error": "Please provide symbol and market."}
+    payload = _av_request({"function": "CURRENCY_EXCHANGE_RATE", "from_currency": crypto, "to_currency": target})
+    if payload.get("error"):
+        return payload
+    data = payload.get("Realtime Currency Exchange Rate") or {}
+    if not data:
+        return {"error": f"Alpha Vantage returned no crypto quote for {crypto}/{target}."}
+    return {
+        "symbol": crypto,
+        "market": target,
+        "exchange_rate": _av_number(data.get("5. Exchange Rate")),
+        "bid_price": _av_number(data.get("8. Bid Price")),
+        "ask_price": _av_number(data.get("9. Ask Price")),
+        "last_refreshed": data.get("6. Last Refreshed"),
+    }
+
+
+@mcp.tool(title="Get Economic Indicator (Alpha Vantage)", annotations=AV_TOOL_ANNOTATIONS)
+@_coverage_tool("economic_indicator", "Alpha Vantage", "values")
+def get_economic_indicator_av(indicator: str = "") -> dict:
+    """Return a supported US macroeconomic series from Alpha Vantage."""
+    selected = _normalize_text(indicator).upper()
+    valid = {"REAL_GDP", "CPI", "UNEMPLOYMENT", "FEDERAL_FUNDS_RATE", "TREASURY_YIELD"}
+    if selected not in valid:
+        return {"error": f"Invalid indicator. Choose one of: {', '.join(sorted(valid))}."}
+    params = {"function": selected}
+    if selected == "TREASURY_YIELD":
+        params.update({"interval": "monthly", "maturity": "10year"})
+    payload = _av_request(params)
+    if payload.get("error"):
+        return payload
+    values = [
+        {"date": row.get("date"), "value": _av_number(row.get("value"))}
+        for row in payload.get("data", [])[:250]
+    ]
+    if not values:
+        return {"error": f"Alpha Vantage returned no data for {selected}."}
+    return {"indicator": selected, "name": payload.get("name"), "interval": payload.get("interval"), "unit": payload.get("unit"), "values": values}
+
+
+@mcp.tool(title="Get News Sentiment (Alpha Vantage)", annotations=AV_TOOL_ANNOTATIONS)
+@_coverage_tool("news_sentiment", "Alpha Vantage", "news", 50)
+def get_news_sentiment_av(tickers_or_topics: str = "") -> dict:
+    """Return Alpha Vantage news sentiment for comma-separated tickers or topics."""
+    query = _normalize_text(tickers_or_topics)
+    if not query:
+        return {"error": "Please provide tickers_or_topics."}
+    parameter = "topics" if query.lower().startswith("topics:") else "tickers"
+    value = query.split(":", 1)[1].strip() if parameter == "topics" else query.upper()
+    payload = _av_request({"function": "NEWS_SENTIMENT", parameter: value, "limit": "50"})
+    if payload.get("error"):
+        return payload
+    feed = payload.get("feed") or []
+    if not feed:
+        return {"error": f"Alpha Vantage returned no news sentiment for '{query}'."}
+    news = [
+        {
+            "title": item.get("title"),
+            "url": item.get("url"),
+            "published_at": item.get("time_published"),
+            "source": item.get("source"),
+            "summary": item.get("summary"),
+            "overall_sentiment_score": _av_number(item.get("overall_sentiment_score")),
+            "overall_sentiment_label": item.get("overall_sentiment_label"),
+        }
+        for item in feed[:50]
+    ]
+    return {"query": query, "news": news}
 
 
 @mcp.tool(
@@ -1177,6 +1482,8 @@ def _market_snapshot_for_ticker(raw_ticker: Any) -> dict:
         }
     try:
         quote_result = get_stock_quote(symbol)
+        if isawaitable(quote_result):
+            quote_result = asyncio.run(quote_result)
         if quote_result.get("error"):
             return {"ticker": symbol, "error": quote_result["error"]}
         return {
@@ -1313,8 +1620,4 @@ def search_finance_research_batch(
 
 
 if __name__ == "__main__":
-    mcp.run(
-        transport="streamable-http",
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", 8000)),
-    )
+    mcp.run(transport="streamable-http")
