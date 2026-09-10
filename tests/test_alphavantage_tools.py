@@ -1,4 +1,8 @@
+from datetime import date, timedelta
+import json
 import os
+from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -30,6 +34,39 @@ class AlphaVantageQuotaTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             with self.assertRaisesRegex(RuntimeError, "ALPHA_VANTAGE_API_KEY"):
                 alphavantage_client.request({"function": "GLOBAL_QUOTE"})
+
+    def test_daily_quota_resumes_from_persisted_state_after_restart(self):
+        with tempfile.TemporaryDirectory() as temp_directory:
+            state_file = Path(temp_directory) / ".av_quota_state.json"
+            state_file.write_text(
+                json.dumps({"date": date.today().isoformat(), "count": 20}),
+                encoding="utf-8",
+            )
+
+            restarted_client = alphavantage_client.AlphaVantageClient(state_file)
+
+            self.assertEqual(restarted_client._daily_count, 20)
+            self.assertEqual(
+                alphavantage_client.DAILY_LIMIT - restarted_client._daily_count,
+                5,
+            )
+
+    def test_stale_daily_quota_resets_after_restart(self):
+        with tempfile.TemporaryDirectory() as temp_directory:
+            state_file = Path(temp_directory) / ".av_quota_state.json"
+            yesterday = date.today() - timedelta(days=1)
+            state_file.write_text(
+                json.dumps({"date": yesterday.isoformat(), "count": 20}),
+                encoding="utf-8",
+            )
+
+            restarted_client = alphavantage_client.AlphaVantageClient(state_file)
+
+            self.assertEqual(restarted_client._daily_count, 0)
+            self.assertEqual(
+                alphavantage_client.DAILY_LIMIT - restarted_client._daily_count,
+                25,
+            )
 
 
 class AlphaVantageToolTests(unittest.TestCase):

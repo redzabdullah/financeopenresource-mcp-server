@@ -21,6 +21,7 @@ htmlcov/
 # Local configuration and secrets
 .env
 .env.*
+.av_quota_state.json
 
 # Editor and operating-system files
 .idea/

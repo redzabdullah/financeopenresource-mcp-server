@@ -49,10 +49,12 @@ Yahoo Finance tools automatically:
 - `get_economic_indicator_av`
 - `get_news_sentiment_av`
 
-All Alpha Vantage tools share one in-memory free-tier quota tracker: at most 25
-requests per 24 hours and five requests in a rolling 60-second window. The
-server rejects an exhausted request before any HTTP call and reports when quota
-capacity resets. Counters are process-local and restart with the server.
+All Alpha Vantage tools share one free-tier quota tracker: at most 25 requests
+per day and five requests in a rolling 60-second window. The server rejects an
+exhausted request before any HTTP call and reports when quota capacity resets.
+Daily usage persists across server restarts in `.av_quota_state.json`, a
+git-ignored local runtime-state file; the rolling minute window remains in
+memory.
 
 ## Coverage contract
 
